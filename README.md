@@ -100,13 +100,15 @@ It is allowable for the manifest file to reference website files that are not ac
 
 ### Uniqueness
 
-Considering the full virtual file system that is established by the manifest, the file and directory names must obey three uniqueness constraints.
+Considering the full virtual file system that is established by the manifest, the file and directory names must obey four uniqueness constraints.
 
 The first uniqueness constraint is that each virtual directory may have at most one file whose Bitsy encoding begins with `index.` (case-insensitive with the dot as the last character).  This is used to ensure there is no more than one index page per directory (see later section).
 
 The second uniqueness constraint is that within each directory among the set of file and subdirectory names that do not begin with `index.` (case-insensitive), the Bitsy decoding of each each file and subdirectory name must be unique.  Note that since `index.` files are excluded from the set examined by this constraint, it is possible to have a directory that contains both `index.html` and `xq--index-x.html` even though both Bitsy decode to the name `index.html`  (In this case, the `index.html` will represent the page returned for the directory itself, while `xq--index-x.html` will be a file within the directory named `index.html` as explained in a later section.)
 
-The third uniqueness constraint is that the Bitsy encoding of directory names may not begin with a case-insensitive match for `index.`  This is not really about uniqueness, but the constraint is included here because it is easy to check with the other two.
+The third uniqueness constraint is that no file or directory name in the manifest may be `.` or `..` which are reserved to mean the current directory and parent directory.
+
+The fourth uniqueness constraint is that the Bitsy encoding of directory names may not begin with a case-insensitive match for `index.`  This is not really about uniqueness, but the constraint is included here because it is easy to check with the other three.
 
 ## Website tree
 
@@ -128,6 +130,8 @@ All file and directory names within the `www` folder of the Zip archive are enco
     www/xz--bcher-nf5/xz--Rotfchse-jboqb.png -> www.example.com/bücher/Rotfüchse.png
 
 Note from the above example that while the mapped URL names are case sensitive, the file names stored in the website archive are case insensitive.  File extension mapping is performed on the Bitsy-encoded file names, rather than their original string value.
+
+Note also that the URLs given above have not yet been subject to percent encoding.  When actually used in HTTP applications, percent encoding will be applied.
 
 ### Index pages
 

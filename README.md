@@ -68,9 +68,51 @@ Using this example, the following shows some examples of how file names would be
     example.png -> image/png
     example.zwx -> application/octet-stream (catch-all type)
 
+## Manifest file
+
+The third file stored within the Zip archive must be a file named `manifest.json` that stores a snapshot of all website data stored within the archive (excluding the manifest file itself, the type declarations file, and the header file).  This third file may optionally be compressed.
+
+The `manifest.json` file must be a JSON data file with a specific format.  The top-level entity in the JSON must be a JSON array.  Each element of this JSON array represents a file object.  File objects must be JSON objects that have at least the following two properties:
+
+1. `path` &mdash; the path within the website tree
+2. `sha256` &mdash; the SHA-256 digest of the data
+
+Both properties must be string values.  The `path` property is the relative path to the file within the `www` folder in the Zip archive.  It must be a sequence of one or more Bitsy-encoded names separated by forward slashes.  The `sha256` property stores the SHA-256 digest of the file contents as a string of base-16 characters.  For example:
+
+    [
+      {
+        "path": "example.html",
+        "sha256": "2cf24dba5fb0a30e26e83b2ac5b9e29e1b161e5c1fa7425e73043362938b9824"
+      },
+      {
+        "path": "xz--bcher-nf5/xz--Rotfchse-jboqb.png",
+        "sha256": "73ef70b681cc631b21dbc1ff5852dc5a74395a9833768fc49e878a5dea1a5a5e"
+      }
+    ]
+
+The manifest array may be empty if there are no files in the website.
+
+The relative file paths given in the manifest are case insensitive in their Bitsy-encoded form.  (The decoded Bitsy format is case sensitive, on the other hand.)
+
+### Sparse archives
+
+It is allowable for the manifest file to reference website files that are not actually present within the Zip archive.  In this case, the Labrador archive is _sparse._  Sparse archives are useful for transferring incremental updates to a website when the receiver already has some of the files.  Sparse archives are also useful in other cases where the client has some other source to consult for the data within the missing files.
+
+### Uniqueness
+
+Considering the full virtual file system that is established by the manifest, the file and directory names must obey three uniqueness constraints.
+
+The first uniqueness constraint is that each virtual directory may have at most one file whose Bitsy encoding begins with `index.` (case-insensitive with the dot as the last character).  This is used to ensure there is no more than one index page per directory (see later section).
+
+The second uniqueness constraint is that within each directory among the set of file and subdirectory names that do not begin with `index.` (case-insensitive), the Bitsy decoding of each each file and subdirectory name must be unique.  Note that since `index.` files are excluded from the set examined by this constraint, it is possible to have a directory that contains both `index.html` and `xq--index-x.html` even though both Bitsy decode to the name `index.html`  (In this case, the `index.html` will represent the page returned for the directory itself, while `xq--index-x.html` will be a file within the directory named `index.html` as explained in a later section.)
+
+The third uniqueness constraint is that the Bitsy encoding of directory names may not begin with a case-insensitive match for `index.`  This is not really about uniqueness, but the constraint is included here because it is easy to check with the other two.
+
 ## Website tree
 
-The whole website archive is contained within a folder named `www` on the top level of the Zip archive.  Files that have `www` as their immediate parent folder will be located in the root directory of the website, while directories within `www` are subdirectories of the root directory of the website.
+The archived website files are contained within a folder named `www` on the top level of the Zip archive.  Files that have `www` as their immediate parent folder will be located in the root directory of the website, while directories within `www` are subdirectories of the root directory of the website.
+
+All files that are included in the `www` directory tree should be referenced from the manifest file.  The manifest file may also reference files that do not exist in the `www` directory tree in the case of sparse archives.
 
 Supposing that a Labrador archive is representing the website at `www.example.com`, here is how files within the Labrador archive would map to URLs:
 
@@ -94,7 +136,7 @@ HTTP allows you to associate file data with directory names, but this is not all
     www/index.html          -> www.example.com/
     www/my/subdir/index.txt -> www.example.com/my/subdir/
 
-The MIME type will be determined for this index file using the usual matching algorithm on the Bitsy-encoded file name.
+The MIME type will be determined for this index file using the usual matching algorithm on the Bitsy-encoded file name.  You are not allowed to use this special format of name for directory names.
 
 Since this system requires a period to follow the `index` name and that there not be any `xq--` or `xz--` Bitsy prefixes, it is still acceptable to have files and directories named as `index` as well as any name that involves a Bitsy prefix:
 

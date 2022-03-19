@@ -77,12 +77,7 @@ Supposing that a Labrador archive is representing the website at `www.example.co
     www/hello.txt           -> www.example.com/hello.txt
     www/my/subdir/file.html -> www.example.com/my/subdir/file.html
 
-HTTP allows you to store pages at directory names, while directories are not allowed to directly contain any file data in Zip files.  If a file has the special name `index` in the Zip archive then it does _not_ refer to a file named `index` in the URL mapping but rather to its parent directory:
-
-    www/index           -> www.example.com/
-    www/my/subdir/index -> www.example.com/my/subdir/
-
-The MIME type used for `index` files will be the blank type if one is defined, and otherwise the catch-all type.
+### Bitsy encoding
 
 All file and directory names within the `www` folder of the Zip archive are encoded with Bitsy.  (The preceding examples still work, because all names used in the preceding examples use pass-through encoding in Bitsy.)  In the URL encoding, the decoded Bitsy original names will be used instead:
 
@@ -91,3 +86,23 @@ All file and directory names within the `www` folder of the Zip archive are enco
     www/xz--bcher-nf5/xz--Rotfchse-jboqb.png -> www.example.com/bücher/Rotfüchse.png
 
 Note from the above example that while the mapped URL names are case sensitive, the file names stored in the website archive are case insensitive.  File extension mapping is performed on the Bitsy-encoded file names, rather than their original string value.
+
+### Index pages
+
+HTTP allows you to associate file data with directory names, but this is not allowed in Zip archives.  If the _Bitsy-encoded_ file name within a Zip archive begins with `index.` (note the dot at the end!) then the file will be returned for the parent directory and _not_ for that file name.  For example:
+
+    www/index.html          -> www.example.com/
+    www/my/subdir/index.txt -> www.example.com/my/subdir/
+
+The MIME type will be determined for this index file using the usual matching algorithm on the Bitsy-encoded file name.
+
+Since this system requires a period to follow the `index` name and that there not be any `xq--` or `xz--` Bitsy prefixes, it is still acceptable to have files and directories named as `index` as well as any name that involves a Bitsy prefix:
+
+    www/index/index      -> www.example.com/index/index
+    www/xz--index-ec.txt -> www.example.com/index.TXT
+
+If you really need a file named something like `index.html` that is not interpreted as a directory page, then you can use a Bitsy `xq--` escaping prefix with a `-x` suffix immediately before the extension like this:
+
+    www/xq--index-x.html -> www.example.com/index.html
+
+Note above that `xq--index-x.html` is not the usual Bitsy encoding for `index.html` so if you want to do this, you will have to manually encode it that way yourself rather than using the Bitsy encoder.  The Bitsy decoder will still decode this name properly.

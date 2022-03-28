@@ -3,7 +3,10 @@ use strict;
 
 # Non-core dependencies
 use Archive::Zip qw( :ERROR_CODES :CONSTANTS);
-use Encode::Bitsy qw(isStrictName);
+use Encode::Bitsy qw(decodeBitsy encodeBitsy isStrictName);
+
+# @@TODO: change compression feature to be property of MIME type
+# mappings
 
 =head1 NAME
 
@@ -127,9 +130,423 @@ See the documentation of each function below for further information.
 # Constants
 # =========
 
-# Maximum number of characters in a Bitsy-encoded URL
+# Maximum number of characters in a Bitsy-encoded path
 #
-my $MAX_URL = 16384;
+my $MAX_ZPATH = 1023;
+
+# ===============
+# Local functions
+# ===============
+
+# Return the encoded normalization of a name.
+#
+# The provided name must be a valid Bitsy-encoded name or a fault will
+# occur during Bitsy decoding.
+#
+# Encoded normalization is defined in the Labrador spec.
+#
+# Parameters:
+#
+#   1 : string - the Bitsy-encoded name
+#
+# Return:
+#
+#   the encoded normalization of the name
+#
+sub encNormName {
+  
+  # Check parameter count
+  ($#_ == 0) or die "Wrong parameter count, stopped";
+  
+  # Get parameters and check types
+  my $str = shift;
+  
+  (not ref($str)) or die "Wrong parameter type, stopped";
+  $str = "$str";
+  
+  # Convert uppercase letters to lowercase
+  $str =~ tr/A-Z/a-z/;
+  
+  # Special handling for xq--index-x. escaping
+  if ($str =~ /^xq--index-x\./) {
+    return $str;
+  }
+  
+  # If name is an index. style name, normalize extension to .i
+  if ($str =~ /^index\./) {
+    $str = 'index.i';
+  }
+  
+  # Bitsy-decode to Unicode, and then re-encode in Bitsy
+  $str = encodeBitsy(decodeBitsy($str));
+  
+  # Return normalized name
+  return $str;
+}
+
+# Return the encoded normalization of a path.
+#
+# The provided path must not be empty, must not begin or end with a
+# forward slash, and must not have two forward slashes in a row
+# anywhere.  The path will be split into components with the forward
+# slash as a separator (with a single component if there are no forward
+# slashes).  Each component will then be encoded-normalized with
+# encNormName(), and the rejoined path will then be returned.
+#
+# This function will verify that no component is "." or ".." and that
+# for all but the last component, the component does not normalize to
+# "index.i" with faults occuring if there are any problems.
+#
+# If the second parameter to this function indicates that this is the
+# path for a directory, then this function will also check that the
+# last component does not normalize to "index.i"
+#
+# Encoded normalization is defined in the Labrador spec.
+#
+# Parameters:
+#
+#   1 : string - the Bitsy-encoded path to normalize
+#
+#   2 : integer - zero if this is a file path, one if this is a
+#   directory path
+#
+# Return:
+#
+#   the encoded normalization of the path
+#
+sub encNormPath {
+  
+  # Check parameter count
+  ($#_ == 1) or die "Wrong number of parameters, stopped";
+  
+  # Get parameters and check types
+  my $path     = shift;
+  my $dir_flag = shift;
+  
+  (not ref($path)) or die "Wrong parameter type, stopped";
+  $path = "$path";
+  
+  (not ref($dir_flag)) or die "Wrong parameter type, stopped";
+  (int($dir_flag) == $dir_flag) or die "Wrong parameter type, stopped";
+  $dir_flag = int($dir_flag);
+  (($dir_flag == 0) or ($dir_flag == 1)) or
+    die "Parameter value out of range, stopped";
+  
+  # Path must not be empty
+  (length($path) > 0) or die "Invalid path, stopped";
+  
+  # Check slashes
+  ((not ($path =~ /^\//)) and (not ($path =~ /\/$/)) and
+      (not ($path =~ /\/\//))) or
+    die "Invalid path, stopped";
+  
+  # Split into components
+  my @pa;
+  if ($path =~ /\//) {
+    @pa = split /\//, $path;
+  } else {
+    push @pa, ($path);
+  }
+  
+  # Transform and check the components
+  for(my $i = 0; $i <= $#pa; $i++) {
+    # Get current component
+    my $c = $pa[$i];
+    
+    # Encoded-normalize component
+    $c = encNormName($c);
+    
+    # Make sure not "." or ".."
+    (($c ne '.') and ($c ne '..')) or die "Invalid path, stopped";
+    
+    # If not last component or if directory flag is set, check that
+    # normalization is not "index.i"
+    if (($i < $#pa) or ($dir_flag)) {
+      ($c ne 'index.i') or die "Invalid path normalization, stopped";
+    }
+    
+    # Update component in array
+    $pa[$i] = $c;
+  }
+  
+  # Return the rejoined path
+  return join '/', @pa;
+}
+
+# Given a Bitsy-encoded URL path to a file and a reference to a virtual
+# file system hash, figure out what directory entries (if any) need to
+# be added to the virtual file system and check that no conflicting
+# files or directories already exist in the virtual file system.
+#
+# The given virtual file system reference must reference a hash with the
+# same structure defined for the "vfs" property of Pack objects in the
+# new() constructor.
+#
+# The provided Bitsy-encoded URL path is first encoded-normalized using
+# encNormPath(), with faults occuring if there are any troubles.  The
+# function checks that nothing currently exists for that normalized
+# value in the hash, faulting otherwise.  This verifies that the full
+# path does not already belong to an existing file or directory.
+#
+# Next, the encoded-normalized path is split into a sequence of one or
+# more labels separated by forward slashes.  If there is only one label,
+# then the path is to a file in the root directory of the website and
+# just return an empty list in that case.
+#
+# Otherwise, iterate through directories in the encoded-normalized
+# directory trail (defined in the Labrador spec), starting with the
+# top-most directory and proceeding to the innermost directory, counting
+# the number of trail elements that already exist as directories in the
+# virtual file system.  If you encounter any elements in the directory
+# trail that reference an existing file in the virtual file system, then
+# a fault occurs.  If you encounter an element in the directory trail
+# that does not exist in the virtual file system, then stop the loop
+# without increasing the count of existing directories.  Otherwise,
+# continue iterating and increasing the count.
+#
+# Go back to the original string argument (before encoding normalization
+# was applied), and split that into a sequence of labels using "/" as a
+# separator.  Generate a directory trail for this new sequence, but skip
+# the first (n) elements of the directory trail, where (n) is the number
+# of already existing directories determined in the previous step.  The
+# result is the list of new directories that need to be added to the
+# virtual file system.
+#
+# Parameters:
+#
+#   1 : string - the Bitsy-encoded URL path to a new file
+#
+#   2 : hash ref - the virtual file system reference
+#
+# Return:
+#
+#   an array of zero or more strings in list context containing the
+#   Bitsy-encoded URL paths to directories that need to be added
+#   (excluding trailing slashes for each path)
+#
+sub findDirs {
+  
+  # Check number of parameters
+  ($#_ == 1) or die "Wrong number of parameters, stopped";
+  
+  # Get parameters and check types
+  my $arg_path = shift;
+  my $vfs      = shift;
+  
+  (not ref($arg_path)) or die "Wrong parameter type, stopped";
+  $arg_path = "$arg_path";
+  
+  (ref($vfs) eq 'HASH') or die "Wrong parameter type, stopped";
+  
+  # Get the encoded-normalized path
+  my $norm_path = encNormPath($arg_path, 0);
+  
+  # Check that normalized path doesn't already exist
+  (not exists $vfs->{$norm_path}) or
+    die "Path already exists in vfs: '$arg_path', stopped";
+  
+  # If the normalized path doesn't have any slashes, then there are no
+  # directories and we can just return an empty list
+  if (not ($norm_path =~ /\//)) {
+    return ();
+  }
+  
+  # If we got here there is at least one slash, so split the normalized
+  # path AND the original path into arrays of components
+  my @pa = split /\//, $norm_path;
+  my @po = split /\//, $arg_path;
+  
+  # Both split arrays should have same number of elements
+  ($#pa == $#po) or die "Unexpected";
+  
+  # Within the directory trail for the normalized path, count how many
+  # elements of the directory trail already exist
+  my $dir_count = 0;
+  for(my $i = 0; $i <= ($#pa - 1); $i++) {
+    # Get the current directory trail path
+    my $d = join '/', @pa[0 .. $i];
+    
+    # Check whether directory entry exists
+    if (exists $vfs->{$d}) {
+      # Entry exists, so check whether it is for a directory
+      if (not ref($vfs->{$d})) {
+        # Entry is for a directory, so just increment the directory
+        # count and continue iterating
+        $dir_count++;
+        
+      } else {
+        # Entry is for a file
+        die "Directory/file conflict in vfs: '$d', stopped";
+      }
+      
+    } else {
+      # Directory entry does not exist, so leave loop without
+      # incrementing directory count
+      last;
+    }
+  }
+  
+  # Compute the result
+  my @result;
+  for(my $i = $dir_count; $i <= ($#pa - 1); $i++) {
+    push @result, (join '/', @po[0 .. $i]);
+  }
+  
+  # Return the result
+  return @result;
+}
+
+# Given a Unicode URL string, encode it properly with Bitsy and check
+# that it is valid.
+#
+# The given string must be non-empty and begin with a forward slash.
+# However, it must not end with a forward slash character, and no
+# forward slash character may be followed immediately with another
+# forward slash character.  No path component may be "." or ".."  When
+# encoded into Bitsy during this function, the encoded length may not
+# exceed 1,023 characters.
+#
+# This function can't be used to directly encode URLs to index pages.
+# Any path components that begin with index. after encoding will be
+# escaped in the Bitsy encoding so that they do not get interpreted as
+# index pages.
+#
+# The returned encoded URL does NOT begin with a forward slash.
+#
+# Parameters:
+#
+#   1 : string - the Unicode path to encode
+#
+# Return:
+#
+#   the Bitsy-encoded URL path
+#
+sub encodeURL {
+  
+  # Check parameter count
+  ($#_ == 0) or die "Wrong number of parameters, stopped";
+  
+  # Get parameters and check types
+  my $str = shift;
+  
+  (not ref($str)) or die "Wrong parameter type, stopped";
+  $str = "$str";
+  
+  # Check that non-empty and begins with forward slash
+  ($str =~ /^\//) or die "Invalid URL, stopped";
+  
+  # Check that last character is not slash and that no slash is followed
+  # immediately by another slash
+  ((not ($str =~ /\/$/)) and (not ($str =~ /\/\//))) or
+    die "Invalid URL, stopped";
+  
+  # If we got here we know the string has at least two characters
+  # because it starts with slash but doesn't end with slash; drop the
+  # opening slash
+  $str = substr $str, 1;
+  
+  # Parse into a sequence of components
+  my @pa;
+  if ($str =~ /\//) {
+    @pa = split /\//, $str;
+  } else {
+    push @pa, ($str);
+  }
+  
+  # Check and transform each component
+  for my $d (@pa) {
+    # Check that neither . nor ..
+    (($d ne '.') and ($d ne '..')) or die "Invalid URL, stopped";
+    
+    # Bitsy-encode component
+    $d = encodeBitsy($d);
+    
+    # If the encoded component begins with index. then escape it
+    if ($d =~ /^index\.(.+)$/) {
+      $d = 'xq--index-x.' . $1;
+    }
+  }
+  
+  # Rejoin to get the transformed path
+  $str = join '/', @pa;
+  
+  # Check length constraint
+  (length($str) <= $MAX_ZPATH) or die "Encode URL is too long, stopped";
+  
+  # Return encoded URL
+  return $str;
+}
+
+# Given a Unicode URL string to a directory and a file extension, encode
+# it properly with Bitsy and produce a file URL to an index file with
+# the given index in the given directory and check that it is valid.
+#
+# The given path string must be non-empty and begin with a forward slash
+# and end with a forward slash.  It may be a one-character string
+# containing only a forward slash.  However, no forward slash character
+# may be followed immediately with another forward slash character.  No
+# path component may be "." or ".."  When encoded into Bitsy during this
+# function, the encoded length may not exceed 1,023 characters.
+#
+# The given file extension will be converted to lowercase by this
+# function.  When "a." is prefixed to it, it must be a valid StrictName
+# according to Bitsy.
+#
+# The returned encoded URL does NOT begin with a forward slash.  The
+# returned URL always ends with an encoded file name that begins with
+# index. followed by the file extension that was provided.
+#
+# Parameters:
+#
+#   1 : string - the Unicode path to directory
+#
+#   2 : string - the file extension for the index page
+#
+# Return:
+#
+#   the Bitsy-encoded URL path to the index file
+#
+sub encodeIndexURL {
+  
+  # Check parameter count
+  ($#_ == 1) or die "Wrong number of parameters, stopped";
+  
+  # Get parameters and check types
+  my $dir_path = shift;
+  my $file_ext = shift;
+  
+  (not ref($dir_path)) or die "Wrong parameter type, stopped";
+  $dir_path = "$dir_path";
+  
+  (not ref($file_ext)) or die "Wrong parameter type, stopped";
+  $file_ext = "$file_ext";
+  
+  # Make file extension lowercase and check it
+  $file_ext =~ tr/A-Z/a-z/;
+  (isStrictName('a.' . $file_ext)) or
+    die "Invalid file extension, stopped";
+  
+  # Check that directory path begins and ends with a slash
+  (($dir_path =~ /^\//) and ($dir_path =~ /\/$/)) or
+    die "Invalid directory URL, stopped";
+  
+  # Suffix a dummy name "a" to the directory path and then encode this
+  # URL
+  my $url = encodeURL($dir_path . 'a');
+  
+  # Drop the last character from the encoded URL so we have just the
+  # prefix before the dummy file name (which might be empty)
+  $url = substr $url, 0, -1;
+  
+  # Suffix the index page with the proper extension
+  $url = $url . 'index.' . $file_ext;
+  
+  # Check length constraint
+  (length($url) <= $MAX_ZPATH) or die "Encode URL is too long, stopped";
+  
+  # Return the result
+  return $url;
+}
 
 =head1 CONSTRUCTOR
 
@@ -166,66 +583,49 @@ sub new {
   # represent the virtual file system that is being constructed within
   # the Labrador archive.
   #
-  # Each key is either a file key or a folder key.  File keys are a
-  # sequence of zero or more Bitsy-encoded, lowercased directory names
-  # each followed by a forward slash, and then a required Bitsy-encoded,
-  # lowercased file name.  Folder keys are a sequence of one or more
-  # Bitsy-encoded, lowercased directory names each followed by a forward
-  # slash.  It is easy to distinguish between the two key types:  file
-  # keys never end with a forward slash while folder keys always end
-  # with a forward slash.  Neither key type ever has a forward slash at
-  # the beginning.
-  #
-  # Note that file and folder keys do NOT exactly match the encoded
-  # names that will be used in the Labrador archive, because file and
-  # folder keys have the case of each letter normalized to lowercase,
-  # while names in the Labrador archive may use both lowercase and
-  # uppercase, preserving original case as much as possible.
-  #
-  # Folder keys always map to a string value containing their path
-  # without case normalization applied.  Whenever a non-sparse file is
-  # added to the virtual file system, a check is made that each
-  # directory in the trail (excluding the root directory) has a folder
-  # key, and any missing folder keys are added as new entries.  For
-  # example:
-  #
-  #   New file: /example/path/to/file.txt
-  #   Requires the following folder keys to be added if not present:
-  #     /example/
-  #     /example/path/
-  #     /example/path/to/
-  #
-  # Sparse files that are being added by digest only do NOT require any
-  # folder keys, since those files will not actually be stored directly
-  # in the archive.
-  #
-  # Note also that index pages corresponding to URL directories are NOT
-  # represented by folder keys but rather by file keys, using the same
-  # special "index" encoding described in the Labrador spec.
-  #
-  # File keys always map to a hash reference that represents the file
-  # object.  The hash reference always has the following property:
-  #
-  #   - url : the encoded URL path to the file (not case normalized)
+  # Each key is an encoded-normalized path to a file or a folder, with
+  # folder paths NOT ending in a trailing slash.  Specifically, a key is
+  # a sequence of one or more labels, where every label after the first
+  # is preceded by a forward slash.  All labels except the last are
+  # directory names that have been encoded-normalized.  The last label
+  # is either a file name or a directory name, both of which must also
+  # be encoded-normalized.  No label may be "." or ".." and no directory
+  # label in encoded-normalized form may be "index.i"
   # 
-  # This property is the same as the file key, except that it may also
-  # contain uppercase letters.
+  # Before adding a key to the "vfs" hash, you must make sure that keys
+  # for each directory in the directory trail already exist, and that
+  # all such keys are for folders.
+  #
+  # Keys for folders map to a string value containing the Bitsy-encoded
+  # path to the folder, NOT including a trailing slash.  The total
+  # length in characters of this folder path must not exceed MAX_ZPATH,
+  # and the encoded-normalization of the folder path must be equal to
+  # the key for the folder.
+  #
+  # Keys for files always map to a hash reference that represents the
+  # file object.  The hash reference always has the following property:
+  #
+  #   - url : the encoded URL path to the file
+  # 
+  # The total length in characters of this property may not exceed
+  # MAX_ZPATH, and the encoded-normalization of this URL path must be
+  # equal to the key for this file.
   #
   # File objects that are being packed from a file in the local file
   # system will have the following additional properties:
   #
-  #   - path : the path to the source file in the local file system
-  #   - compress : 1 to pack with compression, 0 for no compression
+  #   - src : the path to the source file in the local file system
+  #   - cmp : 1 to pack with compression, 0 for no compression
   #
   # File objects that are being packed from a string will have the
   # following additional property:
   #
-  #   - text : string containing raw octets of data
+  #   - txt : string containing raw octets of data
   # 
   # File objects that are being added with the sparse method will have
   # the following additional property:
   #
-  #   - sha256 : the SHA-256 digest as a string of base-16 characters
+  #   - dig : the SHA-256 digest as a string of base-16 characters
   #
   $self->{'vfs'} = { };
   
@@ -400,36 +800,29 @@ actually be read and packed when the compile function is called.
 
 url is a string that gives the URL that this file should be associated
 with in the archived website.  The passed URL must B<not> be
-Bitsy-encoded.  You may use Unicode in the passed url string.  The url
-string must be non-empty and neither begin nor end with forward slash
-characters.  Furthermore, no forward slash character may be followed
-immediately with another forward slash character.  If there are no
-forward slash characters, the whole url is a file name in the root
-directory of the website.  Otherwise, the url is a sequence of directory
-names each terminated by a forward slash, and then the file name at the
-end.
+Bitsy-encoded and does B<not> use any sort of percent encoding.  You may
+use Unicode in the passed url string.  The url string must be non-empty
+and begin with a forward slash.  However, it must not end with a forward
+slash character, and no forward slash character may be followed
+immediately with another forward slash character.  No path component may
+be "." or ".."  When encoded into Bitsy during this function, the
+encoded length may not exceed 1,023 characters.
 
-The url will be split into a sequence of zero or more directory names
-and a file name.  Each directory and file name must successfully encode
-into Bitsy, and the total length of the Bitsy-encoded path when
-reassembled with forward slash separators must not exceed the MAX_URL
-character limit defined within this module.
+The given url must not already exist in the website.  Also, for any
+parent and ancestor folders containing the file specified in the URL,
+the folder path must either already exist in the website as a folder or
+not exist at all.  If any folder paths already exist as a file, a fault
+will occur.
 
-Starting at the root directory of the website and proceeding folder by
-folder to the parent folder of the file named by the URL, each folder
-path along the way when case-normalized to lowercase must not match any
-existing file in the virtual file system.  Folder keys will be added for
-each folder path along the way if they do not already exist.
+This function can not be used to add index pages.  If you give a url
+that has a file name starting with index. then this function will escape
+it in the Bitsy encoding so that it doesn't get interpreted as an index
+page.  Similarly, any directory names in the path that begin with index.
+will be escaped, since directories may never be indices.
 
-The full Bitsy-encoded URL path to the file must not match any folder
-key when a forward slash is appended to it.  Also, the full
-Bitsy-encoded URL path must not already exist as a file in the virtual
-file system.
-
-It is not necessary to declare file extension to MIME type mappings
-before adding files with that extension.  You can establish MIME type
-mappings at any point before compile is called.  All that matters is the
-state of the MIME type mapping at the time the compile function is
+The current state of the MIME type mappings has no bearing whatsoever
+when this function is called.  The only thing that matters is the state
+of the MIME type mappings when the compile function is eventually
 called.
 
 path is a string that gives the path to the file on the local file
@@ -445,6 +838,11 @@ Generally, you should compress files for efficiency.  However, if a file
 is already compressed (such as a JPEG or PNG image), then there is not
 much point to compressing it again, so compression is better disabled
 for those types of files.
+
+Files added with this function may still end up sparse in the generated
+archive if they are empty or if there are duplicate files and this file
+is not the primary copy, as explained in the Labrador spec.  This is
+determined when the compile function is called.
 
 =cut
 
@@ -474,73 +872,486 @@ sub packFile {
   (($compress == 0) or ($compress == 1)) or
     die "Wrong parameter type, stopped";
   
-  # Check that URL is not empty, that it doesn't begin nor end with
-  # forward slashes, and that no forward slash immediately follows
-  # another forward slash
-  (length($url) > 0) or die "Invalid URL, stopped";
-  ((not ($url =~ /^\//)) and (not ($url =~ /\/$/)) and
-    (not ($url =~ /\/\//))) or die "Invalid URL, stopped";
+  # Make sure path references an existing file
+  (-f $path) or die "Can't find file '$path', stopped";
   
-  # Split URL into directory trail and file name
-  my @dtr;
-  my $fname;
-  if ($url =~ /\//) {
-    # URL has at least one forward slash, so begin by splitting by
-    # slashes
-    @dtr = split /\//, $url;
-    
-    # Should have at least two components
-    ($#dtr > 0) or die "Unexpected";
-    
-    # The last component is actually the file name
-    $fname = pop @dtr;
-    
-  } else {
-    # URL has no foward slash, so leave directory trail empty and set
-    # file name to whole passed URL
-    $fname = $url;
+  # Encode the URL
+  $url = encodeURL($url);
+  
+  # Figure out the directories that need to be added, and check at the
+  # same time that we are able to add this URL into our virtual file
+  # system
+  my @nda = findDirs($url, $self->{'vfs'});
+  
+  # Add all new directories
+  for my $d (@nda) {
+    $self->{'vfs'}->{encNormPath($d, 1)} = $d;
   }
   
-  # Encode all directory names and the file name to Bitsy
-  eval {
-    for my $d (@dtr) {
-      $d = encodeBitsy($d);
-    }
-    $fname = encodeBitsy($fname);
-    
+  # Add the file object
+  $self->{'vfs'}->{encNormPath($url, 0)} = {
+    'url' => $url,
+    'src' => $path,
+    'cmp' => $compress
   };
-  if ($@) {
-    die "Bitsy encoding failed for URL component: $@";
+}
+
+=item B<object->packString(url, data)>
+
+Register a raw data string that will be packed into the Labrador
+archive.
+
+data is a string containing the octets that will be added to this file.
+All numeric character codes must be in range [0, 255].  If you are
+adding a text string, be sure to encode it first.
+
+url is a string that gives the URL that this file should be associated
+with in the archived website.  The passed URL must B<not> be
+Bitsy-encoded and does B<not> use any sort of percent encoding.  You may
+use Unicode in the passed url string.  The url string must be non-empty
+and begin with a forward slash.  However, it must not end with a forward
+slash character, and no forward slash character may be followed
+immediately with another forward slash character.  No path component may
+be "." or ".."  When encoded into Bitsy during this function, the
+encoded length may not exceed 1,023 characters.
+
+The given url must not already exist in the website.  Also, for any
+parent and ancestor folders containing the file specified in the URL,
+the folder path must either already exist in the website as a folder or
+not exist at all.  If any folder paths already exist as a file, a fault
+will occur.
+
+This function can not be used to add index pages.  If you give a url
+that has a file name starting with index. then this function will escape
+it in the Bitsy encoding so that it doesn't get interpreted as an index
+page.  Similarly, any directory names in the path that begin with index.
+will be escaped, since directories may never be indices.
+
+The current state of the MIME type mappings has no bearing whatsoever
+when this function is called.  The only thing that matters is the state
+of the MIME type mappings when the compile function is eventually
+called.
+
+Files added with this function may still end up sparse in the generated
+archive if they are empty or if there are duplicate files and this file
+is not the primary copy, as explained in the Labrador spec.  This is
+determined when the compile function is called.
+
+=cut
+
+sub packString {
+  
+  # Check parameter count
+  ($#_ == 2) or die "Wrong number of parameters, stopped";
+  
+  # Get parameters and check types
+  my $self = shift;
+  my $url  = shift;
+  my $data = shift;
+  
+  (ref($self)) or die "Wrong self type, stopped";
+  ($self->isa(__PACKAGE__)) or die "Wrong self type, stopped";
+  
+  (not ref($url)) or die "Wrong parameter type, stopped";
+  $url = "$url";
+  
+  (not ref($data)) or die "Wrong parameter type, stopped";
+  $data = "$data";
+  
+  # Make sure data includes only octets
+  ($data =~ /^[\x{0}-\x{ff}]*$/) or
+    die "String data must be raw octets, stopped";
+  
+  # Encode the URL
+  $url = encodeURL($url);
+  
+  # Figure out the directories that need to be added, and check at the
+  # same time that we are able to add this URL into our virtual file
+  # system
+  my @nda = findDirs($url, $self->{'vfs'});
+  
+  # Add all new directories
+  for my $d (@nda) {
+    $self->{'vfs'}->{encNormPath($d, 1)} = $d;
   }
   
-  # Within the directory trail, get the index of the first element that
-  # does not have a directory key, also checking that no directories
-  # conflict with existing files; if everything in the directory trail
-  # is already present as a directory key, set this index to the length
-  # of the directory trail array
-  my $newdir_i;
-  for($newdir_i = 0; $newdir_i <= $#dtr; $newdir_i++) {
-    # Assemble the URL path to the current directory in the trail
-    my $upath = join '/', @dtr[0 .. $newdir_i];
-    
-    # Make the assembled URL path lowercase
-    $upath =~ tr/A-Z/a-z/;
-    
-    # Check first whether the assembled URL path refers to a file within
-    # the virtual file system
-    (not exists $self->{'vfs'}->{$upath}) or
-      die "Directory conflicts with existing file, stopped";
-    
-    # Check whether the assembled URL path with a forward slash appended
-    # already exists in the virtual file system
-    if (not exists $self->{'vfs'}->{$upath . '/'}) {
-      # We found the first directory index that doesn't exist, so leave
-      # the loop
-      last;
-    }
+  # Add the file object
+  $self->{'vfs'}->{encNormPath($url, 0)} = {
+    'url' => $url,
+    'txt' => $data
+  };
+}
+
+=item B<object->sparseDigest(url, sha256)>
+
+Register a SHA-256 digest for a file that will be added into the
+Labrador archive with the sparse method.
+
+sha256 is the SHA-256 digest as a string containing a sequence of
+exactly 64 base-16 characters.  This function will automatically convert
+the string to lowercase.
+
+url is a string that gives the URL that this file should be associated
+with in the archived website.  The passed URL must B<not> be
+Bitsy-encoded and does B<not> use any sort of percent encoding.  You may
+use Unicode in the passed url string.  The url string must be non-empty
+and begin with a forward slash.  However, it must not end with a forward
+slash character, and no forward slash character may be followed
+immediately with another forward slash character.  No path component may
+be "." or ".."  When encoded into Bitsy during this function, the
+encoded length may not exceed 1,023 characters.
+
+The given url must not already exist in the website.  Also, for any
+parent and ancestor folders containing the file specified in the URL,
+the folder path must either already exist in the website as a folder or
+not exist at all.  If any folder paths already exist as a file, a fault
+will occur.
+
+This function can not be used to add index pages.  If you give a url
+that has a file name starting with index. then this function will escape
+it in the Bitsy encoding so that it doesn't get interpreted as an index
+page.  Similarly, any directory names in the path that begin with index.
+will be escaped, since directories may never be indices.
+
+The current state of the MIME type mappings has no bearing whatsoever
+when this function is called.  The only thing that matters is the state
+of the MIME type mappings when the compile function is eventually
+called.
+
+=cut
+
+sub sparseDigest {
+  
+  # Check parameter count
+  ($#_ == 2) or die "Wrong number of parameters, stopped";
+  
+  # Get parameters and check types
+  my $self = shift;
+  my $url  = shift;
+  my $sha  = shift;
+  
+  (ref($self)) or die "Wrong self type, stopped";
+  ($self->isa(__PACKAGE__)) or die "Wrong self type, stopped";
+  
+  (not ref($url)) or die "Wrong parameter type, stopped";
+  $url = "$url";
+  
+  (not ref($sha)) or die "Wrong parameter type, stopped";
+  $sha = "$sha";
+  
+  # Make digest lowercase and check format
+  $sha =~ tr/A-Z/a-z/;
+  ($sha =~ /^[0-9a-f]{64}$/) or die "Invalid SHA-256 digest, stopped";
+  
+  # Encode the URL
+  $url = encodeURL($url);
+  
+  # Figure out the directories that need to be added, and check at the
+  # same time that we are able to add this URL into our virtual file
+  # system
+  my @nda = findDirs($url, $self->{'vfs'});
+  
+  # Add all new directories
+  for my $d (@nda) {
+    $self->{'vfs'}->{encNormPath($d, 1)} = $d;
   }
   
-  # @@TODO:
+  # Add the file object
+  $self->{'vfs'}->{encNormPath($url, 0)} = {
+    'url' => $url,
+    'dig' => $sha
+  };
+}
+
+=item B<object->packIndexFile(url, ext, path, compress)>
+
+Register an index file that will be packed into the Labrador archive.
+
+This function does not actually read the file yet.  Instead, it simply
+records the registration internally in the object.  The file will
+actually be read and packed when the compile function is called.
+
+url is a string that gives the URL of the directory that this index file
+should be associated with in the archived website.  The passed URL must
+B<not> be Bitsy-encoded and does B<not> use any sort of percent
+encoding.  You may use Unicode in the passed url string.  The url string
+must be non-empty, begin with a forward slash, and end with a forward
+slash (an url consisting of just a forward slash is OK).  However, no
+forward slash character may be followed immediately with another forward
+slash character.  No path component may be "." or ".."  When encoded
+into Bitsy during this function, the encoded length may not exceed 1,023
+characters.
+
+No index file may already exist in the website for the given directory,
+even if the other index file has a different extension.  Also, the given
+directory and all parent and ancestor folders must either already exist
+in the website as a folder or not exist at all.  If any folder paths
+already exist as a file, a fault will occur.
+
+This function will automatically add the appropriate Bitsy-encoded index
+file name to the end of the encoded URL, followed by the extension given
+by the ext parameter.  This extension must be a StrictName according to
+Bitsy if 'a.' is prefixed to it.  However, any directory names in the
+given path that begin with index. will be escaped in the Bitsy encoding,
+since directories may never be indices.
+
+The current state of the MIME type mappings has no bearing whatsoever
+when this function is called.  The only thing that matters is the state
+of the MIME type mappings when the compile function is eventually
+called.
+
+path is a string that gives the path to the file on the local file
+system that will be read when the compile function is called.  The local
+path to the file has no effect whatsoever on the URL stored within the
+file or the MIME type of the file.  This function will merely check that
+the path refers to a regular file using the -f operator.
+
+compress must be an integer that is either 1 or 0.  If it is 1, then the
+file will be compressed when packed into the archive.  If it is 0, then
+the file will not be compressed when packed into the archive.
+Generally, you should compress files for efficiency.  However, if a file
+is already compressed (such as a JPEG or PNG image), then there is not
+much point to compressing it again, so compression is better disabled
+for those types of files.
+
+Files added with this function may still end up sparse in the generated
+archive if they are empty or if there are duplicate files and this file
+is not the primary copy, as explained in the Labrador spec.  This is
+determined when the compile function is called.
+
+=cut
+
+sub packIndexFile {
+  
+  # Check parameter count
+  ($#_ == 4) or die "Wrong number of parameters, stopped";
+  
+  # Get parameters and check types
+  my $self     = shift;
+  my $url      = shift;
+  my $ext      = shift;
+  my $path     = shift;
+  my $compress = shift;
+  
+  (ref($self)) or die "Wrong self type, stopped";
+  ($self->isa(__PACKAGE__)) or die "Wrong self type, stopped";
+  
+  (not ref($url)) or die "Wrong parameter type, stopped";
+  $url = "$url";
+  
+  (not ref($ext)) or die "Wrong parameter type, stopped";
+  $ext = "$ext";
+  
+  (not ref($path)) or die "Wrong parameter type, stopped";
+  $path = "$path";
+  
+  (not ref($compress)) or die "Wrong parameter type, stopped";
+  (int($compress) == $compress) or die "Wrong parameter type, stopped";
+  $compress = int($compress);
+  (($compress == 0) or ($compress == 1)) or
+    die "Wrong parameter type, stopped";
+  
+  # Make sure path references an existing file
+  (-f $path) or die "Can't find file '$path', stopped";
+  
+  # Encode the index URL
+  $url = encodeIndexURL($url, $ext);
+  
+  # Figure out the directories that need to be added, and check at the
+  # same time that we are able to add this URL into our virtual file
+  # system
+  my @nda = findDirs($url, $self->{'vfs'});
+  
+  # Add all new directories
+  for my $d (@nda) {
+    $self->{'vfs'}->{encNormPath($d, 1)} = $d;
+  }
+  
+  # Add the file object
+  $self->{'vfs'}->{encNormPath($url, 0)} = {
+    'url' => $url,
+    'src' => $path,
+    'cmp' => $compress
+  };
+}
+
+=item B<object->packIndexString(url, ext, data)>
+
+Register a raw data string that will be packed into the Labrador
+archive as an index file.
+
+data is a string containing the octets that will be added to this file.
+All numeric character codes must be in range [0, 255].  If you are
+adding a text string, be sure to encode it first.
+
+url is a string that gives the URL of the directory that this index file
+should be associated with in the archived website.  The passed URL must
+B<not> be Bitsy-encoded and does B<not> use any sort of percent
+encoding.  You may use Unicode in the passed url string.  The url string
+must be non-empty, begin with a forward slash, and end with a forward
+slash (an url consisting of just a forward slash is OK).  However, no
+forward slash character may be followed immediately with another forward
+slash character.  No path component may be "." or ".."  When encoded
+into Bitsy during this function, the encoded length may not exceed 1,023
+characters.
+
+No index file may already exist in the website for the given directory,
+even if the other index file has a different extension.  Also, the given
+directory and all parent and ancestor folders must either already exist
+in the website as a folder or not exist at all.  If any folder paths
+already exist as a file, a fault will occur.
+
+This function will automatically add the appropriate Bitsy-encoded index
+file name to the end of the encoded URL, followed by the extension given
+by the ext parameter.  This extension must be a StrictName according to
+Bitsy if 'a.' is prefixed to it.  However, any directory names in the
+given path that begin with index. will be escaped in the Bitsy encoding,
+since directories may never be indices.
+
+The current state of the MIME type mappings has no bearing whatsoever
+when this function is called.  The only thing that matters is the state
+of the MIME type mappings when the compile function is eventually
+called.
+
+Files added with this function may still end up sparse in the generated
+archive if they are empty or if there are duplicate files and this file
+is not the primary copy, as explained in the Labrador spec.  This is
+determined when the compile function is called.
+
+=cut
+
+sub packIndexString {
+  
+  # Check parameter count
+  ($#_ == 3) or die "Wrong number of parameters, stopped";
+  
+  # Get parameters and check types
+  my $self = shift;
+  my $url  = shift;
+  my $ext  = shift;
+  my $data = shift;
+  
+  (ref($self)) or die "Wrong self type, stopped";
+  ($self->isa(__PACKAGE__)) or die "Wrong self type, stopped";
+  
+  (not ref($url)) or die "Wrong parameter type, stopped";
+  $url = "$url";
+  
+  (not ref($ext)) or die "Wrong parameter type, stopped";
+  $ext = "$ext";
+  
+  (not ref($data)) or die "Wrong parameter type, stopped";
+  $data = "$data";
+  
+  # Make sure data includes only octets
+  ($data =~ /^[\x{0}-\x{ff}]*$/) or
+    die "String data must be raw octets, stopped";
+  
+  # Encode the URL
+  $url = encodeIndexURL($url, $ext);
+  
+  # Figure out the directories that need to be added, and check at the
+  # same time that we are able to add this URL into our virtual file
+  # system
+  my @nda = findDirs($url, $self->{'vfs'});
+  
+  # Add all new directories
+  for my $d (@nda) {
+    $self->{'vfs'}->{encNormPath($d, 1)} = $d;
+  }
+  
+  # Add the file object
+  $self->{'vfs'}->{encNormPath($url, 0)} = {
+    'url' => $url,
+    'txt' => $data
+  };
+}
+
+=item B<object->sparseIndexDigest(url, ext, sha256)>
+
+Register a SHA-256 digest for an index file that will be added into the
+Labrador archive with the sparse method.
+
+sha256 is the SHA-256 digest as a string containing a sequence of
+exactly 64 base-16 characters.  This function will automatically convert
+the string to lowercase.
+
+url is a string that gives the URL of the directory that this index file
+should be associated with in the archived website.  The passed URL must
+B<not> be Bitsy-encoded and does B<not> use any sort of percent
+encoding.  You may use Unicode in the passed url string.  The url string
+must be non-empty, begin with a forward slash, and end with a forward
+slash (an url consisting of just a forward slash is OK).  However, no
+forward slash character may be followed immediately with another forward
+slash character.  No path component may be "." or ".."  When encoded
+into Bitsy during this function, the encoded length may not exceed 1,023
+characters.
+
+No index file may already exist in the website for the given directory,
+even if the other index file has a different extension.  Also, the given
+directory and all parent and ancestor folders must either already exist
+in the website as a folder or not exist at all.  If any folder paths
+already exist as a file, a fault will occur.
+
+This function will automatically add the appropriate Bitsy-encoded index
+file name to the end of the encoded URL, followed by the extension given
+by the ext parameter.  This extension must be a StrictName according to
+Bitsy if 'a.' is prefixed to it.  However, any directory names in the
+given path that begin with index. will be escaped in the Bitsy encoding,
+since directories may never be indices.
+
+The current state of the MIME type mappings has no bearing whatsoever
+when this function is called.  The only thing that matters is the state
+of the MIME type mappings when the compile function is eventually
+called.
+
+=cut
+
+sub sparseIndexDigest {
+  
+  # Check parameter count
+  ($#_ == 3) or die "Wrong number of parameters, stopped";
+  
+  # Get parameters and check types
+  my $self = shift;
+  my $url  = shift;
+  my $ext  = shift;
+  my $sha  = shift;
+  
+  (ref($self)) or die "Wrong self type, stopped";
+  ($self->isa(__PACKAGE__)) or die "Wrong self type, stopped";
+  
+  (not ref($url)) or die "Wrong parameter type, stopped";
+  $url = "$url";
+  
+  (not ref($ext)) or die "Wrong parameter type, stopped";
+  $ext = "$ext";
+  
+  (not ref($sha)) or die "Wrong parameter type, stopped";
+  $sha = "$sha";
+  
+  # Make digest lowercase and check format
+  $sha =~ tr/A-Z/a-z/;
+  ($sha =~ /^[0-9a-f]{64}$/) or die "Invalid SHA-256 digest, stopped";
+  
+  # Encode the URL
+  $url = encodeIndexURL($url, $ext);
+  
+  # Figure out the directories that need to be added, and check at the
+  # same time that we are able to add this URL into our virtual file
+  # system
+  my @nda = findDirs($url, $self->{'vfs'});
+  
+  # Add all new directories
+  for my $d (@nda) {
+    $self->{'vfs'}->{encNormPath($d, 1)} = $d;
+  }
+  
+  # Add the file object
+  $self->{'vfs'}->{encNormPath($url, 0)} = {
+    'url' => $url,
+    'dig' => $sha
+  };
 }
 
 =back
